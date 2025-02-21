@@ -19,6 +19,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.ViewGroup.LayoutParams
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.KeyEvent as KeyEventAndroid
+import android.view.ViewConfiguration
 import android.graphics.Rect
 import android.media.AudioManager
 import android.accessibilityservice.AccessibilityServiceInfo
@@ -34,10 +35,15 @@ import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
 import hbb.KeyEventConverter
 
+// const val BUTTON_UP = 2
+// const val BUTTON_BACK = 0x08
+
 const val LEFT_DOWN = 9
 const val LEFT_MOVE = 8
 const val LEFT_UP = 10
 const val RIGHT_UP = 18
+// (BUTTON_BACK << 3) | BUTTON_UP
+const val BACK_UP = 66
 const val WHEEL_BUTTON_DOWN = 33
 const val WHEEL_BUTTON_UP = 34
 const val WHEEL_DOWN = 523331
@@ -64,13 +70,15 @@ class InputService : AccessibilityService() {
 
     private val logTag = "input service"
     private var leftIsDown = false
-    private var touchPath = Path()
+    private val touchPath = Path()
     private var stroke: GestureDescription.StrokeDescription? = null
     private var lastTouchGestureStartTime = 0L
     private var mouseX = 0
     private var mouseY = 0
     private var timer = Timer()
     private var recentActionTask: TimerTask? = null
+    // 100(tap timeout) + 400(long press timeout)
+    private val longPressDuration = ViewConfiguration.getTapTimeout().toLong() + ViewConfiguration.getLongPressTimeout().toLong()
 
     private val wheelActionsQueue = LinkedList<GestureDescription>()
     private var isWheelActionsPolling = false
@@ -102,7 +110,7 @@ class InputService : AccessibilityService() {
             }
         }
 
-        // left button down ,was up
+        // left button down, was up
         if (mask == LEFT_DOWN) {
             isWaitingLongPress = true
             timer.schedule(object : TimerTask() {
@@ -112,19 +120,19 @@ class InputService : AccessibilityService() {
                         continueGesture(mouseX, mouseY)
                     }
                 }
-            }, LONG_TAP_DELAY * 4)
+            }, longPressDuration)
 
             leftIsDown = true
             startGesture(mouseX, mouseY)
             return
         }
 
-        // left down ,was down
+        // left down, was down
         if (leftIsDown) {
             continueGesture(mouseX, mouseY)
         }
 
-        // left up ,was down
+        // left up, was down
         if (mask == LEFT_UP) {
             if (leftIsDown) {
                 leftIsDown = false
@@ -135,6 +143,11 @@ class InputService : AccessibilityService() {
         }
 
         if (mask == RIGHT_UP) {
+            longPress(mouseX, mouseY)
+            return
+        }
+
+        if (mask == BACK_UP) {
             performGlobalAction(GLOBAL_ACTION_BACK)
             return
         }
@@ -244,6 +257,26 @@ class InputService : AccessibilityService() {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun performClick(x: Int, y: Int, duration: Long) {
+        val path = Path()
+        path.moveTo(x.toFloat(), y.toFloat())
+        try {
+            val longPressStroke = GestureDescription.StrokeDescription(path, 0, duration)
+            val builder = GestureDescription.Builder()
+            builder.addStroke(longPressStroke)
+            Log.d(logTag, "performClick x:$x y:$y time:$duration")
+            dispatchGesture(builder.build(), null, null)
+        } catch (e: Exception) {
+            Log.e(logTag, "performClick, error:$e")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun longPress(x: Int, y: Int) {
+        performClick(x, y, longPressDuration)
+    }
+
     private fun startGesture(x: Int, y: Int) {
         touchPath.reset()
         touchPath.moveTo(x.toFloat(), y.toFloat())
@@ -273,7 +306,7 @@ class InputService : AccessibilityService() {
             stroke?.let {
                 val builder = GestureDescription.Builder()
                 builder.addStroke(it)
-                Log.d(logTag, "end gesture x:$x y:$y time:$duration")
+                Log.d(logTag, "doDispatchGesture x:$x y:$y time:$duration")
                 dispatchGesture(builder.build(), null, null)
             }
         } catch (e: Exception) {
