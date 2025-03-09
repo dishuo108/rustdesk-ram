@@ -38,6 +38,9 @@ env:
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
+  RS_PUB_KEY: "${{ secrets.RS_PUB_KEY }}"
+  RENDEZVOUS_SERVER: "${{ secrets.RENDEZVOUS_SERVER }}"
+  API_SERVER: "${{ secrets.API_SERVER }}"
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}"
 
@@ -49,7 +52,7 @@ jobs:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     with:
       upload-artifact: ${{ inputs.upload-artifact }}
-      target: windows-2022
+      target: windows-2025
       configuration: Release
       platform: x64
       target_version: Windows10
@@ -64,15 +67,15 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          # - { target: i686-pc-windows-msvc        , os: windows-2022                  }
-          # - { target: x86_64-pc-windows-gnu       , os: windows-2022                  }
+          # - { target: i686-pc-windows-msvc        , os: windows-2025                  }
+          # - { target: x86_64-pc-windows-gnu       , os: windows-2025                  }
           - {
               target: x86_64-pc-windows-msvc,
-              os: windows-2022,
+              os: windows-2025,
               arch: x86_64,
               vcpkg-triplet: x64-windows-static,
             }
-          # - { target: aarch64-pc-windows-msvc, os: windows-2022, arch: aarch64 }
+          # - { target: aarch64-pc-windows-msvc, os: windows-2025, arch: aarch64 }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v6
@@ -255,15 +258,15 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          # - { target: i686-pc-windows-msvc        , os: windows-2022                  }
-          # - { target: x86_64-pc-windows-gnu       , os: windows-2022                  }
+          # - { target: i686-pc-windows-msvc        , os: windows-2025                  }
+          # - { target: x86_64-pc-windows-gnu       , os: windows-2025                  }
           - {
               target: i686-pc-windows-msvc,
-              os: windows-2022,
+              os: windows-2025,
               arch: x86,
               vcpkg-triplet: x86-windows-static,
             }
-          # - { target: aarch64-pc-windows-msvc, os: windows-2022 }
+          # - { target: aarch64-pc-windows-msvc, os: windows-2025 }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v6
