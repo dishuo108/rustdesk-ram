@@ -1544,27 +1544,47 @@ impl<T: InvokeUiSession> Remote<T> {
                                 job.modify_time();
                                 err = job.job_error();
                                 job_type = job.r#type;
-                                printer_data = job.get_buf_data();
+                                printer_data = match job.get_buf_data().await {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        log::error!("Failed to get the printer data: {}", e);
+                                        None
+                                    }
+                                };
                             }
                             match job_type {
                                 fs::JobType::Generic => {
                                     self.handle_job_status(d.id, d.file_num, err);
                                 }
-                                fs::JobType::Printer =>
-                                {
-                                    #[cfg(target_os = "windows")]
-                                    if let Some(data) = printer_data {
-                                        let printer_name = self
-                                            .handler
-                                            .printer_names
-                                            .write()
-                                            .unwrap()
-                                            .remove(&d.id);
-                                        crate::platform::send_raw_data_to_printer(
-                                            printer_name,
-                                            data,
-                                        )
-                                        .ok();
+                                fs::JobType::Printer => {
+                                    if let Some(err) = err {
+                                        log::error!("Receive print job failed, error {err}");
+                                    } else {
+                                        log::info!(
+                                            "Receive print job done, data len: {:?}",
+                                            printer_data.as_ref().map(|d| d.len()).unwrap_or(0)
+                                        );
+                                        #[cfg(target_os = "windows")]
+                                        if let Some(data) = printer_data {
+                                            let printer_name = self
+                                                .handler
+                                                .printer_names
+                                                .write()
+                                                .unwrap()
+                                                .remove(&d.id);
+                                            // Spawn a new thread to handle the print job.
+                                            // Or print job will block the ui thread.
+                                            std::thread::spawn(move || {
+                                                if let Err(e) =
+                                                    crate::platform::send_raw_data_to_printer(
+                                                        printer_name,
+                                                        data,
+                                                    )
+                                                {
+                                                    log::error!("Print job error: {}", e);
+                                                }
+                                            });
+                                        }
                                     }
                                 }
                             }
