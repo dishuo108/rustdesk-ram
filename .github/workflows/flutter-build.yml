@@ -886,7 +886,7 @@ jobs:
     needs:
       - build-for-macOS
       - build-for-windows-flutter
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: ${{ inputs.upload-artifact }}
     steps:
       - name: Download artifacts
