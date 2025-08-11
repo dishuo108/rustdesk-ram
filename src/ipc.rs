@@ -1,4 +1,5 @@
 use crate::{
+    common::CheckTestNatType,
     privacy_mode::PrivacyModeState,
     ui_interface::{get_local_option, set_local_option},
 };
@@ -22,10 +23,12 @@ pub use clipboard::ClipboardFile;
 use hbb_common::{
     allow_err, bail, bytes,
     bytes_codec::BytesCodec,
-    config::{self, Config, Config2},
+    config::{self, keys::OPTION_ALLOW_WEBSOCKET, Config, Config2},
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
-    log, password_security as password, timeout,
+    log,
+    message_proto::FileTransferSendConfirmRequest,
+    password_security as password, timeout,
     tokio::{
         self,
         io::{AsyncRead, AsyncWrite},
@@ -104,6 +107,7 @@ pub enum FS {
         last_modified: u64,
         is_upload: bool,
     },
+    SendConfirm(Vec<u8>),
     Rename {
         id: i32,
         path: String,
@@ -189,6 +193,7 @@ pub enum Data {
         id: i32,
         is_file_transfer: bool,
         is_view_camera: bool,
+        is_terminal: bool,
         peer_id: String,
         name: String,
         authorized: bool,
@@ -280,6 +285,11 @@ pub enum Data {
         not(any(target_os = "android", target_os = "ios"))
     ))]
     ControllingSessionCount(usize),
+    #[cfg(target_os = "linux")]
+    TerminalSessionCount(usize),
+    #[cfg(target_os = "windows")]
+    PortForwardSessionCount(Option<usize>),
+    SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -346,29 +356,40 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     }
 }
 
-pub struct CheckIfRestart(String, Vec<String>, String, String);
+pub struct CheckIfRestart {
+    stop_service: String,
+    rendezvous_servers: Vec<String>,
+    audio_input: String,
+    voice_call_input: String,
+    ws: String,
+    api_server: String,
+}
 
 impl CheckIfRestart {
     pub fn new() -> CheckIfRestart {
-        CheckIfRestart(
-            Config::get_option("stop-service"),
-            Config::get_rendezvous_servers(),
-            Config::get_option("audio-input"),
-            Config::get_option("voice-call-input"),
-        )
+        CheckIfRestart {
+            stop_service: Config::get_option("stop-service"),
+            rendezvous_servers: Config::get_rendezvous_servers(),
+            audio_input: Config::get_option("audio-input"),
+            voice_call_input: Config::get_option("voice-call-input"),
+            ws: Config::get_option(OPTION_ALLOW_WEBSOCKET),
+            api_server: Config::get_option("api-server"),
+        }
     }
 }
 impl Drop for CheckIfRestart {
     fn drop(&mut self) {
-        if self.0 != Config::get_option("stop-service")
-            || self.1 != Config::get_rendezvous_servers()
+        if self.stop_service != Config::get_option("stop-service")
+            || self.rendezvous_servers != Config::get_rendezvous_servers()
+            || self.ws != Config::get_option(OPTION_ALLOW_WEBSOCKET)
+            || self.api_server != Config::get_option("api-server")
         {
             RendezvousMediator::restart();
         }
-        if self.2 != Config::get_option("audio-input") {
+        if self.audio_input != Config::get_option("audio-input") {
             crate::audio_service::restart();
         }
-        if self.3 != Config::get_option("voice-call-input") {
+        if self.voice_call_input != Config::get_option("voice-call-input") {
             crate::audio_service::set_voice_call_input_device(
                 Some(Config::get_option("voice-call-input")),
                 true,
@@ -453,15 +474,28 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Socks(Config::get_socks())).await);
             }
             Some(data) => {
+                let _nat = CheckTestNatType::new();
                 if data.proxy.is_empty() {
                     Config::set_socks(None);
                 } else {
                     Config::set_socks(Some(data));
                 }
-                crate::common::test_nat_type();
                 RendezvousMediator::restart();
                 log::info!("socks updated");
             }
+        },
+        Data::SocksWs(s) => match s {
+            None => {
+                allow_err!(
+                    stream
+                        .send(&Data::SocksWs(Some(Box::new((
+                            Config::get_socks(),
+                            Config::get_option(OPTION_ALLOW_WEBSOCKET)
+                        )))))
+                        .await
+                );
+            }
+            _ => {}
         },
         #[cfg(feature = "flutter")]
         Data::VideoConnCount(None) => {
@@ -499,7 +533,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                         None
                     };
                 } else if name == "hide_cm" {
-                    value = if crate::hbbs_http::sync::is_pro() || crate::common::is_custom_client() {
+                    value = if crate::hbbs_http::sync::is_pro() || crate::common::is_custom_client()
+                    {
                         Some(hbb_common::password_security::hide_cm().to_string())
                     } else {
                         None
@@ -542,6 +577,7 @@ async fn handle(data: Data, stream: &mut Connection) {
             }
             Some(value) => {
                 let _chk = CheckIfRestart::new();
+                let _nat = CheckTestNatType::new();
                 if let Some(v) = value.get("privacy-mode-impl-key") {
                     crate::privacy_mode::switch(v);
                 }
@@ -610,6 +646,11 @@ async fn handle(data: Data, stream: &mut Connection) {
         ))]
         Data::ControllingSessionCount(count) => {
             crate::updater::update_controlling_session_count(count);
+        }
+        #[cfg(target_os = "linux")]
+        Data::TerminalSessionCount(_) => {
+            let count = crate::terminal_service::get_terminal_session_count(true);
+            allow_err!(stream.send(&Data::TerminalSessionCount(count)).await);
         }
         #[cfg(feature = "hwcodec")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -690,6 +731,25 @@ async fn handle(data: Data, stream: &mut Connection) {
             None => {
                 // `None` is usually used to get values.
                 // This branch is left blank for unification and further use.
+            }
+        },
+        #[cfg(target_os = "windows")]
+        Data::PortForwardSessionCount(c) => match c {
+            None => {
+                let count = crate::server::AUTHED_CONNS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.conn_type == crate::server::AuthConnType::PortForward)
+                    .count();
+                allow_err!(
+                    stream
+                        .send(&Data::PortForwardSessionCount(Some(count)))
+                        .await
+                );
+            }
+            _ => {
+                // Port forward session count is only a get value.
             }
         },
         _ => {}
@@ -1092,6 +1152,7 @@ pub fn set_option(key: &str, value: &str) {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
+    let _nat = CheckTestNatType::new();
     if let Ok(mut c) = connect(1000, "").await {
         c.send(&Data::Options(Some(value.clone()))).await?;
         // do not put below before connect, because we need to check should_exit
@@ -1149,6 +1210,7 @@ pub async fn get_socks() -> Option<config::Socks5Server> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
+    let _nat = CheckTestNatType::new();
     Config::set_socks(if value.proxy.is_empty() {
         None
     } else {
@@ -1159,6 +1221,29 @@ pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
         .send(&Data::Socks(Some(value)))
         .await?;
     Ok(())
+}
+
+async fn get_socks_ws_(ms_timeout: u64) -> ResultType<(Option<config::Socks5Server>, String)> {
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::SocksWs(None)).await?;
+    if let Some(Data::SocksWs(Some(value))) = c.next_timeout(ms_timeout).await? {
+        Config::set_socks(value.0.clone());
+        Config::set_option(OPTION_ALLOW_WEBSOCKET.to_string(), value.1.clone());
+        Ok(*value)
+    } else {
+        Ok((
+            Config::get_socks(),
+            Config::get_option(OPTION_ALLOW_WEBSOCKET),
+        ))
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_socks_ws() -> (Option<config::Socks5Server>, String) {
+    get_socks_ws_(1_000).await.unwrap_or((
+        Config::get_socks(),
+        Config::get_option(OPTION_ALLOW_WEBSOCKET),
+    ))
 }
 
 pub fn get_proxy_status() -> bool {
@@ -1199,6 +1284,16 @@ pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
 pub async fn notify_server_to_check_hwcodec() -> ResultType<()> {
     connect(1_000, "").await?.send(&&Data::CheckHwcodec).await?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub async fn get_port_forward_session_count(ms_timeout: u64) -> ResultType<usize> {
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::PortForwardSessionCount(None)).await?;
+    if let Some(Data::PortForwardSessionCount(Some(count))) = c.next_timeout(ms_timeout).await? {
+        return Ok(count);
+    }
+    bail!("Failed to get port forward session count");
 }
 
 #[cfg(feature = "hwcodec")]
@@ -1301,6 +1396,18 @@ pub async fn update_controlling_session_count(count: usize) -> ResultType<()> {
     let mut c = connect(1000, "").await?;
     c.send(&Data::ControllingSessionCount(count)).await?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_terminal_session_count() -> ResultType<usize> {
+    let ms_timeout = 1_000;
+    let mut c = connect(ms_timeout, "").await?;
+    c.send(&Data::TerminalSessionCount(0)).await?;
+    if let Some(Data::TerminalSessionCount(c)) = c.next_timeout(ms_timeout).await? {
+        return Ok(c);
+    }
+    Ok(0)
 }
 
 async fn handle_wayland_screencast_restore_token(
