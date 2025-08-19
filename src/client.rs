@@ -192,13 +192,19 @@ impl Client {
         conn_type: ConnType,
         interface: impl Interface,
     ) -> ResultType<(
-        (Stream, bool, Option<Vec<u8>>, Option<KcpStream>),
+        (
+            Stream,
+            bool,
+            Option<Vec<u8>>,
+            Option<KcpStream>,
+            &'static str,
+        ),
         (i32, String),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
-        match Self::_start(peer, key, token, conn_type, interface).await {
+        match Self::_start(peer, key, token, conn_type, interface.clone()).await {
             Err(err) => {
                 let err_str = err.to_string();
                 if err_str.starts_with("Failed") {
@@ -207,7 +213,19 @@ impl Client {
                     return Err(err);
                 }
             }
-            Ok(x) => Ok(x),
+            Ok(x) => {
+                // Set x.2 to true only in the connect() function to indicate that direct_failures needs to be updated; everywhere else it should be set to false.
+                if x.2 {
+                    let direct_failures = interface.get_lch().read().unwrap().direct_failures;
+                    let direct = x.0 .1;
+                    if !interface.is_force_relay() && (direct_failures == 0) != direct {
+                        let n = if direct { 0 } else { 1 };
+                        log::info!("direct_failures updated to {}", n);
+                        interface.get_lch().write().unwrap().set_direct_failure(n);
+                    }
+                }
+                Ok((x.0, x.1))
+            }
         }
     }
 
@@ -219,8 +237,15 @@ impl Client {
         conn_type: ConnType,
         interface: impl Interface,
     ) -> ResultType<(
-        (Stream, bool, Option<Vec<u8>>, Option<KcpStream>),
+        (
+            Stream,
+            bool,
+            Option<Vec<u8>>,
+            Option<KcpStream>,
+            &'static str,
+        ),
         (i32, String),
+        bool,
     )> {
         if config::is_incoming_only() {
             bail!("Incoming only mode");
@@ -234,8 +259,10 @@ impl Client {
                     true,
                     None,
                     None,
+                    "TCP",
                 ),
                 (0, "".to_owned()),
+                false,
             ));
         }
         // Allow connect to {domain}:{port}
@@ -246,8 +273,10 @@ impl Client {
                     true,
                     None,
                     None,
+                    "TCP",
                 ),
                 (0, "".to_owned()),
+                false,
             ));
         }
 
@@ -257,7 +286,7 @@ impl Client {
         } else {
             (peer, "", key, token)
         };
-        let (mut rendezvous_server, servers, contained) = if other_server.is_empty() {
+        let (rendezvous_server, servers, contained) = if other_server.is_empty() {
             crate::get_rendezvous_server(1_000).await
         } else {
             if other_server == PUBLIC_SERVER {
@@ -329,7 +358,7 @@ impl Client {
         );
         connect_futures.push(fut.boxed());
         match select_ok(connect_futures).await {
-            Ok(conn) => Ok((conn.0 .0, conn.0 .1)),
+            Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
             Err(e) => Err(e),
         }
     }
@@ -346,8 +375,15 @@ impl Client {
         servers: Vec<String>,
         contained: bool,
     ) -> ResultType<(
-        (Stream, bool, Option<Vec<u8>>, Option<KcpStream>),
+        (
+            Stream,
+            bool,
+            Option<Vec<u8>>,
+            Option<KcpStream>,
+            &'static str,
+        ),
         (i32, String),
+        bool,
     )> {
         let mut start = Instant::now();
         let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
@@ -417,6 +453,7 @@ impl Client {
             (None, None)
         };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
+        let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
         msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
@@ -430,7 +467,13 @@ impl Client {
             ..Default::default()
         });
         for i in 1..=3 {
-            log::info!("#{} punch attempt with {}, id: {}", i, my_addr, peer);
+            log::info!(
+                "#{} {} punch attempt with {}, id: {}",
+                i,
+                punch_type,
+                my_addr,
+                peer
+            );
             socket.send(&msg_out).await?;
             // below timeout should not bigger than hbbs's connection timeout.
             if let Some(msg_in) =
@@ -481,7 +524,7 @@ impl Client {
                                     }
                                 }
                             }
-                            log::info!("Hole Punched {} = {}", peer, peer_addr);
+                            log::info!("{} Hole Punched {} = {}", punch_type, peer, peer_addr);
                             break;
                         }
                     }
@@ -514,7 +557,7 @@ impl Client {
                         connect_futures.push(
                             async move {
                                 let conn = fut.await?;
-                                Ok((conn, None, "Relay"))
+                                Ok((conn, None, if use_ws() { "WebSocket" } else { "Relay" }))
                             }
                             .boxed(),
                         );
@@ -529,7 +572,11 @@ impl Client {
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
                         let pk =
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
-                        return Ok(((conn, false, pk, kcp), (feedback, rendezvous_server)));
+                        return Ok((
+                            (conn, typ == "IPv6", pk, kcp, typ),
+                            (feedback, rendezvous_server),
+                            false,
+                        ));
                     }
                     _ => {
                         log::error!("Unexpected protobuf msg received: {:?}", msg_in);
@@ -543,8 +590,9 @@ impl Client {
         }
         let time_used = start.elapsed().as_millis() as u64;
         log::info!(
-            "{} ms used to punch hole, relay_server: {}, {}",
+            "{} ms used to {} punch hole, relay_server: {}, {}",
             time_used,
+            punch_type,
             relay_server,
             if is_local {
                 "is_local: true".to_owned()
@@ -570,9 +618,11 @@ impl Client {
                 interface,
                 udp.0,
                 ipv6.0,
+                punch_type,
             )
             .await?,
             (feedback, rendezvous_server),
+            true,
         ))
     }
 
@@ -594,7 +644,14 @@ impl Client {
         interface: impl Interface,
         udp_socket_nat: Option<Arc<UdpSocket>>,
         udp_socket_v6: Option<Arc<UdpSocket>>,
-    ) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>)> {
+        punch_type: &str,
+    ) -> ResultType<(
+        Stream,
+        bool,
+        Option<Vec<u8>>,
+        Option<KcpStream>,
+        &'static str,
+    )> {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
@@ -652,7 +709,6 @@ impl Client {
         };
 
         let mut direct = !conn.is_err();
-        interface.update_direct(Some(direct));
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
                 conn = Self::request_relay(
@@ -665,8 +721,9 @@ impl Client {
                     conn_type,
                 )
                 .await;
-                interface.update_direct(Some(false));
                 if let Err(e) = conn {
+                    // this direct is mainly used by on_establish_connection_error, so we update it here before bail
+                    interface.update_direct(Some(false));
                     bail!("Failed to connect via relay server: {}", e);
                 }
                 typ = "Relay";
@@ -675,15 +732,23 @@ impl Client {
                 bail!("Failed to make direct connection to remote desktop");
             }
         }
-        if !relay_server.is_empty() && (direct_failures == 0) != direct {
-            let n = if direct { 0 } else { 1 };
-            log::info!("direct_failures updated to {}", n);
-            interface.get_lch().write().unwrap().set_direct_failure(n);
-        }
         let mut conn = conn?;
-        log::info!("{:?} used to establish {typ} connection", start.elapsed());
-        let pk = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await?;
-        Ok((conn, direct, pk, kcp))
+        log::info!(
+            "{:?} used to establish {typ} connection with {} punch",
+            start.elapsed(),
+            punch_type
+        );
+        let res = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await;
+        let pk: Option<Vec<u8>> = match res {
+            Ok(pk) => pk,
+            Err(e) => {
+                // this direct is mainly used by on_establish_connection_error, so we update it here before bail
+                interface.update_direct(Some(direct));
+                bail!(e);
+            }
+        };
+        log::debug!("{} punch secure_connection ok", punch_type);
+        Ok((conn, direct, pk, kcp, typ))
     }
 
     /// Establish secure connection with the server.
