@@ -823,6 +823,15 @@ impl RendezvousMediator {
     }
 
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
+        if let Some(hardcoded_relay) = hbb_common::config::HARD_SETTINGS.read().unwrap().get("relay-server") {
+            let relay_with_port = if !hardcoded_relay.contains(':') {
+                format!("{}:{}", hardcoded_relay, hbb_common::config::RELAY_PORT)
+            } else {
+                hardcoded_relay.clone()
+            };
+            return relay_with_port;
+        }
+        
         let mut relay_server = Config::get_option("relay-server");
         if relay_server.is_empty() {
             relay_server = provided_by_rendezvous_server;

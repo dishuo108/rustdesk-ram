@@ -81,6 +81,15 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if args.is_empty() {
+        #[cfg(target_os = "windows")]
+        let is_installed_need_service = crate::platform::is_installed() 
+            && !crate::platform::is_self_service_running();
+        
+        #[cfg(target_os = "windows")]
+        if is_installed_need_service {
+            args.push("--install-service".to_string());
+        }
+        
         #[cfg(target_os = "linux")]
         let should_check_start_tray = crate::check_process("--server", false);
         // We can use `crate::check_process("--server", false)` on Windows.
